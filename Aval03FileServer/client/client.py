@@ -1,7 +1,7 @@
-import socket
+import socket, os
 
 SERVIDOR = "localhost"
-PORTA    = 2121
+PORTA = 2121
 
 def conectaAoServidor():
     global sock
@@ -27,8 +27,6 @@ def listaArquivos():
         tamanhoListagem -= len(resposta)
         print (resposta.decode())
     return
-
-import os
 
 def downloadArquivo():
     comando = b"DOW"

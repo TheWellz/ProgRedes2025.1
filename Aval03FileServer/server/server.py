@@ -1,4 +1,4 @@
-import socket, os, threading, glob
+import socket, os, threading, glob, hashlib
 
 SERVIDOR = ""
 PORTA = 2121
@@ -11,7 +11,7 @@ def escutaPorta():
     sock.bind((SERVIDOR, PORTA))
     sock.listen(5)
 
-def leComando():
+def leComando(sockCon):
     tamanhoComando = int.from_bytes(sockCon.recv(4), byteorder='big')
     comando = b''
     while tamanhoComando > 0:
@@ -24,10 +24,16 @@ def adicionaTamanho(dados):
     tamanho = len(dados)
     return tamanho.to_bytes(4, byteorder='big') + dados
 
-def respondeComandoNulo():
+def pastaPermitida(caminhoArquivo, pastaBase):
+    caminhoRealArquivo = os.path.realpath(caminhoArquivo)
+    caminhoRealPastaBase = os.path.realpath(pastaBase)
+    caminhoRealPastaBase = os.path.join(caminhoRealPastaBase, '')
+    return caminhoRealArquivo.startswith(caminhoRealPastaBase)
+
+def respondeComandoNulo(sockCon):
     sockCon.send(adicionaTamanho(b''))
 
-def respondeComandoDir():
+def respondeComandoDir(sockCon):
     listaArquivos = os.listdir(PASTAARQ)
     resposta = ""
     for nomeArquivo in listaArquivos:
@@ -37,10 +43,15 @@ def respondeComandoDir():
             resposta += f"{nomeArquivo} - {tamanhoArquivo} bytes\r\n"
     sockCon.send(adicionaTamanho(resposta.encode()))
 
-def respondeComandoDow(nomeArquivo):
+def respondeComandoDow(sockCon, nomeArquivo):
     nomeArquivo = os.path.join(PASTAARQ, nomeArquivo)
+
+    if not pastaPermitida(nomeArquivo, PASTAARQ):
+        sockCon.send(adicionaTamanho(b''))
+        return
+
     if not os.path.exists(nomeArquivo):
-        sockCon.send((0).to_bytes(4, 'big'))
+        sockCon.send(adicionaTamanho(b''))
         return
 
     tamArquivo = os.path.getsize(nomeArquivo)
@@ -52,10 +63,15 @@ def respondeComandoDow(nomeArquivo):
             sockCon.send(dados)
             dados = fd.read(8192)
 
-def respondeComandoDMA(mascara):
+def respondeComandoDMA(sockCon, mascara):
     caminhoMascara = os.path.join(PASTAARQ, mascara)
     arquivosEncontrados = glob.glob(caminhoMascara)
-    nomesArquivos = [os.path.basename(arquivo) for arquivo in arquivosEncontrados]
+    nomesArquivos = []
+
+    for arquivo in arquivosEncontrados:
+        caminhoArquivo = os.path.realpath(arquivo)
+        if pastaPermitida(caminhoArquivo, PASTAARQ):
+            nomesArquivos.append(os.path.basename(arquivo))
 
     if not nomesArquivos:
         sockCon.send(adicionaTamanho(b''))
@@ -65,41 +81,101 @@ def respondeComandoDMA(mascara):
     sockCon.send(adicionaTamanho(listaNomeArquivos))
 
     for nomeArquivo in nomesArquivos:
-        respostaCliente = leComando()
+        respostaCliente = leComando(sockCon)
         if respostaCliente == b"SKIP":
             continue
         elif respostaCliente == b"OK":
-            respondeComandoDow(nomeArquivo)
+            respondeComandoDow(sockCon, nomeArquivo)
 
-def processaComando(comando):
+def respondeComandoMd5(sockCon, dados):
+    texto = dados.decode()
+    nomeArquivo, posicaoStr = texto.split('|')
+    posicao = int(posicaoStr)
+
+    caminhoArquivo = os.path.join(PASTAARQ, nomeArquivo)
+    if not pastaPermitida(caminhoArquivo, PASTAARQ):
+        sockCon.send(adicionaTamanho(b''))
+        return
+            
+    if not os.path.exists(caminhoArquivo):
+        sockCon.send(adicionaTamanho(b''))
+        return
+
+    fd = open(caminhoArquivo, "rb")
+    conteudo = fd.read(posicao)
+    fd.close()
+
+    md5hash = hashlib.md5(conteudo).hexdigest()
+    sockCon.send(adicionaTamanho(md5hash.encode()))
+
+def respondeComandoDra(sockCon, dados):
+    try:
+        texto = dados.decode()
+        nomeArquivo, posicaoStr, hashCliente = texto.split('|')
+        posicao = int(posicaoStr)
+
+        caminhoArquivo = os.path.join(PASTAARQ, nomeArquivo)
+
+        if not pastaPermitida(caminhoArquivo, PASTAARQ):
+            sockCon.send(adicionaTamanho(b''))
+            return
+
+        if not os.path.exists(caminhoArquivo):
+            sockCon.send(adicionaTamanho(b''))
+            return
+        
+        fd = open(caminhoArquivo, "rb")
+        bytesIniciais = fd.read(posicao)
+
+        if hashlib.md5(bytesIniciais).hexdigest() != hashCliente:
+            fd.close()
+            sockCon.send(adicionaTamanho(b''))
+            return
+        
+        bytesRestantes = fd.read()
+        fd.close()
+
+        sockCon.send(adicionaTamanho(bytesRestantes))
+
+    except:
+        sockCon.send(adicionaTamanho(b''))
+
+def processaComando(sockCon, comando):
     if comando[:3] == b'DIR':
-        respondeComandoDir()
+        respondeComandoDir(sockCon)
     elif comando[:3] == b'DOW':
-        respondeComandoDow(comando[3:].decode()) 
+        respondeComandoDow(sockCon, comando[3:].decode())
     elif comando[:3] == b'DMA':
-        respondeComandoDMA(comando[3:].decode())
+        respondeComandoDMA(sockCon, comando[3:].decode())
+    elif comando[:3] == b'MD5':
+        respondeComandoMd5(sockCon, comando[3:])
+    elif comando[:3] == b'DRA':
+        respondeComandoDra(sockCon, comando[3:])
     else:
-        respondeComandoNulo()
+        respondeComandoNulo(sockCon)
 
 def trataCliente(sockConexao, cliente):
-    global sockCon
-    sockCon = sockConexao
     print(f"Tratando conexão com {cliente}")
-    allClients.append(sockCon)
+    allClients.append(sockConexao)
     try:
         while True:
-            comando = leComando()
+            comando = leComando(sockConexao)
             if comando:
-                processaComando(comando)
+                processaComando(sockConexao, comando)
             else:
-                allClients.remove(sockCon)
-                sockCon.close()
+                allClients.remove(sockConexao)
+                sockConexao.close()
                 print("Fechando conexão porque o cliente fechou.")
                 break
-    except:
-        allClients.remove(sockCon)
-        sockCon.close()
-        print("Fechando conexão porque o servidor caiu abruptamente.")
+    except Exception as e:
+        print(f"[{cliente}] Erro: {e}") 
+        if sockConexao in allClients:
+            allClients.remove(sockConexao)
+        try:
+            sockConexao.close()
+        except:
+            pass
+        print(f"[{cliente}] Conexão finalizada com erro.")
 
 def main():
     escutaPorta()
